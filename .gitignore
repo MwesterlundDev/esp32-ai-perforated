@@ -24,3 +24,5 @@ videos/
 *.mov
 *.MOV
 *.MP4
+.venv-pai/
+PAI_demo/
