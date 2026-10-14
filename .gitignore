@@ -29,3 +29,4 @@ PAI_demo/
 .DS_Store
 PAI_head*/
 perf-license.sh
+PAI_core*/

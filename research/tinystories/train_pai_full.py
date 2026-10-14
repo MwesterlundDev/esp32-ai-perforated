@@ -1,9 +1,10 @@
-"""Full PerforatedAI integration (not demo mode): a dendrite on the output head.
+"""Full PerforatedAI integration (not demo mode): dendrites on chosen layers.
 
 Copy of train.py, changed only where PerforatedAI needs it (search "PAI"):
-  * the dendrite target is the output head, set explicitly (".head"), not whatever
-    demo mode would pick (it picks blocks.5.ple_proj). The head shares its weight
-    with tok_emb, so GPA's experimental weight-tying support is switched on.
+  * the dendrite targets are set explicitly with --targets (default ".head", the
+    output head; demo mode would have picked blocks.5.ple_proj). The head shares
+    its weight with tok_emb, so GPA's experimental weight-tying support is
+    switched on (the checkpoint writer needs it even when .head is not a target).
   * PerforatedAI decides when training ends, so the fixed-length cosine schedule
     cannot be used. Training is chunked into "epochs" of --epoch-steps steps, one
     validation per epoch, and the learning rate is warmup then constant. The
@@ -31,10 +32,10 @@ import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from perforatedai import globals_perforatedai as GPA  # PAI
 from perforatedai import utils_perforatedai as UPA  # PAI
-from perforatedai import demo_perforatedai as DPA  # PAI: only for set_conversion_lists
 
 from model import Config, make_model
 
@@ -77,6 +78,45 @@ def evaluate(model, batcher, iters):
     losses = [model(*batcher())[1].item() for _ in range(iters)]
     model.train()
     return sum(losses) / len(losses)
+
+
+def set_targets(model, targets):  # PAI
+    """Perforate exactly the modules in `targets` (ids like ".blocks.5.ffn.down",
+    leading dot required) and track every other module that has parameters. Same
+    logic as demo mode's single-target helper, extended to several targets."""
+    paths = set()
+    for target in targets:
+        paths |= {target[:i] for i in range(1, len(target)) if target[i] == "."}
+    tracked_modules, tracked_parameters = [], []
+
+    def visit(module, module_id):
+        for name, _ in module.named_parameters(recurse=False):
+            tracked_parameters.append(module_id + "." + name)
+        for name, child in module.named_children():
+            child_id = module_id + "." + name
+            if child_id in targets:
+                continue
+            if child_id in paths:
+                visit(child, child_id)
+            elif isinstance(child, (nn.ParameterList, nn.ParameterDict)):
+                for pname, _ in child.named_parameters():
+                    tracked_parameters.append(child_id + "." + pname)
+            elif any(True for _ in child.parameters()):
+                tracked_modules.append(child_id)
+
+    names = {"." + n for n, _ in model.named_modules() if n}
+    missing = [t for t in targets if t not in names]
+    if missing:
+        raise SystemExit(f"--targets not found in the model: {missing}. Ids need a "
+                         f"leading dot, e.g. .blocks.5.ffn.down")
+    visit(model, "")
+    GPA.pc.set_modules_to_perforate([])
+    GPA.pc.set_module_names_to_perforate([])
+    GPA.pc.set_modules_to_track([])
+    GPA.pc.set_module_names_to_track([])
+    GPA.pc.set_module_ids_to_perforate(list(targets))
+    GPA.pc.set_module_ids_to_track(tracked_modules)
+    GPA.pc.set_parameter_ids_to_track(tracked_parameters)
 
 
 def build_optimizer(model, lr):
@@ -130,6 +170,9 @@ def main():
     # PAI options
     ap.add_argument("--epoch-steps", type=int, default=250,
                     help="training steps per PAI 'epoch' (one validation each)")
+    ap.add_argument("--targets", default=".head",
+                    help="comma-separated module ids to perforate, leading dot, e.g. "
+                         ".blocks.5.ffn.gate,.blocks.5.ffn.down")
     ap.add_argument("--switch-epochs", type=int, default=8,
                     help="epochs between switches between normal and dendrite training")
     ap.add_argument("--max-dendrites", type=int, default=1)
@@ -167,13 +210,15 @@ def main():
     if not args.control:
         # PAI: configuration, then perforate_model, before the optimizer is built.
         GPA.pc.set_perforated_backpropagation(args.pb)
-        GPA.pc.set_weight_tying_experimental(True)  # head.weight is tok_emb.weight
+        targets = [x.strip() for x in args.targets.split(",") if x.strip()]
+        # head.weight is tok_emb.weight in every arm but fatembed. PAI's checkpoint
+        # writer rejects shared tensors unless this is on, whichever layers are targets.
+        GPA.pc.set_weight_tying_experimental(True)
         GPA.pc.set_output_dimensions([-1, -1, 0])   # [batch, tokens, features]
         GPA.pc.set_configuration_confirmed(True)    # target is set below, skip the picker
         GPA.pc.set_unwrapped_modules_confirmed(True)
-        # Perforate only the head; every other module with parameters is tracked.
-        # (Reuses demo mode's helper for building those lists.)
-        DPA.set_conversion_lists(model, ".head")
+        # Perforate only the targets; every other module with parameters is tracked.
+        set_targets(model, targets)
         if args.capacity_test:
             GPA.pc.set_testing_dendrite_capacity(True)
         else:
@@ -186,7 +231,8 @@ def main():
                 # PB trains dendrites in their own phases; cap each at the length
                 # of the first neuron phase so the run has a bounded length.
                 GPA.pc.set_cap_at_n(True)
-        save_name = "PAI_head" + (f"_{args.tag}" if args.tag else "")
+        save_name = "PAI_core" if ".head" not in targets else "PAI_head"
+        save_name += f"_{args.tag}" if args.tag else ""
         model = UPA.perforate_model(model, save_name=save_name, maximizing_score=False)
         model = model.to(device)
 
@@ -258,6 +304,7 @@ def main():
             "warmup": args.warmup, "epoch_steps": args.epoch_steps,
             "switch_epochs": args.switch_epochs, "max_dendrites": args.max_dendrites,
             "capacity_test": args.capacity_test, "perforated_backprop": args.pb,
+            "targets": args.targets,
             "target_core": args.target_core, "seed": args.seed,
             "schedule": "warmup then constant lr; warmup restarts after a restructure",
         },

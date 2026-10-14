@@ -4,8 +4,10 @@ Date: 2026-10-14. One seed, one short run per condition. Read the
 [Caveats](#caveats) before drawing conclusions.
 
 Part 1 (this section) is the demo-mode pilot. Part 2 is the full integration
-with open-source dendrites on the output head, and Part 3 repeats it with
-Perforated Backpropagation.
+with open-source dendrites on the output head, Part 3 repeats it with
+Perforated Backpropagation, and Part 4 moves the dendrites to two layers in the
+last transformer block (open-source and PB). The table at the start of Part 4
+summarizes every experiment.
 
 ## Summary
 
@@ -480,12 +482,107 @@ average.
   PB cannot help this model elsewhere.
 - Wall times above are from the run receipts on an Apple Silicon Mac (MPS).
 
+# Part 4: dendrites on core layers (last block FFN)
+
+Targets: `blocks.5.ffn.gate` and `blocks.5.ffn.down`, the SwiGLU analogues of
+GPT-2's `mlp.c_fc` and `mlp.c_proj` (96 -> 66 and 66 -> 96). The model uses
+SwiGLU, so there is a third layer, `ffn.up`, with no GPT-2 counterpart; it was
+tracked but not perforated. Everything else matches Parts 2 and 3. Driver:
+`scripts/run_pai_core_experiment.sh`; targets are set with
+`train_pai_full.py --targets`. Receipts:
+`runs/pai-full-pai-ple-core-s0.json` (open-source),
+`runs/pai-full-pai-ple-corepb-s0.json` (PB), log `runs/core-experiment.log`.
+
+The control is the 24-epoch no-dendrite run from Part 3
+(`runs/pai-full-ctl-ple-ctlpb-s0.json`, same seed and data order). It does not
+depend on which layers are targeted, so it was reused. Its first 16 epochs
+agree with Part 2's control to within 0.004 nats.
+
+One setup issue found along the way: PerforatedAI's checkpoint writer rejects
+shared tensors, so `set_weight_tying_experimental(True)` is needed whenever the
+model's `head` and `tok_emb` are tied, even when the head is not a target.
+
+## Summary of all experiments
+
+| Experiment | Target | Mode | Final val vs matched control |
+|---|---|---|---|
+| Part 1, demo-mode pilot | `blocks.5.ple_proj` | open-source | -0.001 (tie) |
+| Part 2 | head | open-source | +0.005 |
+| Part 3 | head | Perforated Backpropagation | +0.003 |
+| Part 4 | `ffn.gate`, `ffn.down` | open-source | +0.002 |
+| Part 4 | `ffn.gate`, `ffn.down` | Perforated Backpropagation | 0.000 |
+
+"Matched" means the same number of main-weight updates. Every gap is inside the
+seed noise (about 0.004-0.006 nats). No dendrite improved on the control.
+
+## Results
+
+| | Dendrite | Control (matched) | Gap | Perplexity |
+|---|---|---|---|---|
+| Open-source, step 4000 | 2.5015 | 2.4996 | +0.0019 | 12.20 vs 12.18 |
+| PB, same main-weight steps (4000) | 2.4996 | 2.4996 | +0.0000 | 12.18 vs 12.18 |
+| PB, same total steps (6000) | 2.4996 | 2.4121 | +0.0875 | 12.18 vs 11.16 |
+
+As in Part 3, PB's dendrite phase (epochs 8-15) trains only the dendrite:
+validation loss is 2.6808 on every one of those epochs. The fair row is the
+second one; the third only shows what the 2000 frozen steps cost.
+
+Gap to the matched control after the dendrite is integrated:
+
+| Run | Epochs | Gap (dendrite - control) |
+|---|---|---|
+| Open-source | 8-12 | +0.013, +0.012, +0.011, +0.011, +0.013 |
+| Open-source | 13-15 | +0.006, +0.006, +0.002 |
+| PB (epochs 16-21) | vs control epochs 8-13 | +0.013, +0.014, +0.009, +0.011, +0.007, +0.009 |
+| PB (epochs 22-23) | vs control epochs 14-15 | -0.003, 0.000 |
+
+Same shape as the head runs: a small lag right after the dendrite goes in, then
+convergence, never ahead. Part of the lag comes from the script restarting the
+optimizer and warmup after a restructure, which the control does not do.
+
+### Cost
+
+| | Parameters | Wall time |
+|---|---|---|
+| Base | 28,869,920 | |
+| With dendrites (final count) | 28,895,426 (+25,506) | open-source 569 s vs 557 s; PB 874 s vs 833 s |
+
+The +25,506 includes a frozen template copy of each layer
+(2 x 6,336 = 12,672). The dendrites themselves add about 12,834 parameters
+(6,402 for `gate`, 6,432 for `down`), under 0.05% of the model; training time
+rose 2-5%.
+
+### Correlation scores (PB)
+
+Best score per layer: 0.062 (`down`) and 0.067 (`gate`), both above the 0.001
+the docs call "learned", but far below the head's 0.448. The best score
+plateaued by epoch 4 of the dendrite phase while 122-162 of the 162 neurons
+still improved slightly each epoch, so the 8-epoch cap was probably not what
+limited it. Source: `PAI_core_corepb/*beforeSwitch_1Best PBScores.csv` (not
+committed).
+
+## Fit on the ESP32
+
+Estimates, not measured. About 6KB at int4 (against 685KB of spare flash) and
+about 0.7 ms per token (the FFN is 6.4 ms of 95 ms per token across all 18
+matrices; one block's two layers plus their dendrites is a small slice). It
+would fit easily, but there is no quality gain to deploy. The runtime and
+exporter work noted in Part 2 would still be needed.
+
+## Caveats
+
+- One seed. All runs are 4000-6000 steps at a constant learning rate, with no
+  final decay. This is the main open condition: dendrites are normally
+  evaluated on converged models, and the shipped model trains 5000 steps with a
+  cosine schedule to ppl 11.94.
+- The control was reused, not rerun for this experiment (see above).
+- Wall times are from the run receipts on an Apple Silicon Mac (MPS).
+
 ## Suggested next step
 
-The head is the wrong target with either kind of dendrite: no quality gain, 1.3MB
-it cannot afford on the ESP32 (see Part 2) and a large training-time cost. The
-remaining option worth testing is a core layer (attention or FFN) as the target,
-which would cost kilobytes of flash and a few percent of compute, so it could
-fit on the chip. With PB, dendrite phases should be shortened (the score
-plateaued after one epoch here), for example with a smaller `--switch-epochs` or
-patience settings.
+Five targets across three modes found no benefit on an under-trained baseline.
+Before spending more on dendrites, test one converged baseline: the shipped
+5000-step cosine configuration (`research/tinystories/scripts/run_deploy_ablation.sh`
+settings) with the same dendrite setup. If that is also a tie, the dendrite line
+can be closed for this model. If it shows a gain, the core-layer target is the
+one that fits on the chip.
