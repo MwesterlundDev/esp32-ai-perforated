@@ -26,3 +26,6 @@ videos/
 *.MP4
 .venv-pai/
 PAI_demo/
+.DS_Store
+PAI_head*/
+perf-license.sh

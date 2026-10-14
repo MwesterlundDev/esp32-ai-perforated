@@ -11,8 +11,9 @@ Copy of train.py, changed only where PerforatedAI needs it (search "PAI"):
   * --control runs the identical loop with no PerforatedAI, for --control-epochs.
     Compare the two at the same number of steps; the JSON has val per epoch.
 
-Dendrites here are the open-source (gradient descent) kind: Perforated
-Backpropagation (perforatedbp) is off unless --pb is given, and needs a license.
+Dendrites here are the open-source (gradient descent) kind unless --pb is given.
+--pb turns on Perforated Backpropagation (perforatedbp), which needs a license:
+set PAIEMAIL and PAITOKEN in the environment (or let it prompt once).
 
 Run from the repo root with the PerforatedAI venv, e.g.
   PYTHONPATH=src .venv-pai/bin/python research/tinystories/train_pai_full.py \\
@@ -181,6 +182,10 @@ def main():
             GPA.pc.set_switch_mode(GPA.pc.DOING_FIXED_SWITCH)
             GPA.pc.set_fixed_switch_num(args.switch_epochs)
             GPA.pc.set_first_fixed_switch_num(args.switch_epochs)
+            if args.pb:
+                # PB trains dendrites in their own phases; cap each at the length
+                # of the first neuron phase so the run has a bounded length.
+                GPA.pc.set_cap_at_n(True)
         save_name = "PAI_head" + (f"_{args.tag}" if args.tag else "")
         model = UPA.perforate_model(model, save_name=save_name, maximizing_score=False)
         model = model.to(device)

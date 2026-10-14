@@ -3,8 +3,9 @@
 Date: 2026-10-14. One seed, one short run per condition. Read the
 [Caveats](#caveats) before drawing conclusions.
 
-Part 1 (this section) is the demo-mode pilot. Part 2, at the end, is the full
-integration with a dendrite on the output head.
+Part 1 (this section) is the demo-mode pilot. Part 2 is the full integration
+with open-source dendrites on the output head, and Part 3 repeats it with
+Perforated Backpropagation.
 
 ## Summary
 
@@ -386,18 +387,105 @@ board.
 - One seed, 4000 steps, constant learning rate with no final decay. A dendrite
   might help more on a converged model.
 - Open-source dendrites only. The library prints that Perforated
-  Backpropagation can give better results; that needs a license and was not
-  part of this run.
+  Backpropagation can give better results; that was tried afterwards, see
+  Part 3.
 - Single small model on one dataset; it says nothing about other models.
 - The seed-noise figure (about 0.006 nats) is from the repo's 5000-step deploy
   ablations, not measured at this setup. The pre-dendrite differences here
   (up to 0.005) are consistent with it.
 
+# Part 3: Perforated Backpropagation, dendrite on the head
+
+Same setup as Part 2 with `--pb` (Perforated Backpropagation, licensed
+`perforatedbp` 3.2.9). Driver: `scripts/run_pai_pb_experiment.sh`. Credentials
+are passed as environment variables (`PAIEMAIL`, `PAITOKEN`) and are not part of
+the repo or the logs. `--pb` also sets `GPA.pc.set_cap_at_n(True)` so each
+dendrite phase is at most as long as the first neuron phase (8 epochs).
+Receipts: `runs/pai-full-pai-ple-pb-s0.json`, `runs/pai-full-ctl-ple-ctlpb-s0.json`;
+log `runs/pb-experiment.log`.
+
+## Summary
+
+- **No gain on a fair comparison.** Compared at the same number of main-weight
+  updates (4000 steps), the PB run ends at val loss 2.5022 (ppl 12.21) against
+  2.4996 (ppl 12.18) for the control: a 0.003 nat gap, inside noise.
+- **The dendrite did learn.** The best node's correlation score reached 0.448
+  in the first dendrite epoch (the docs call anything above 0.001 "learned"),
+  so nothing was misconfigured. It plateaued after that one epoch.
+- **It is expensive.** Dendrite-phase epochs took about 150 s against about
+  35 s for normal epochs (about 4x), and the whole run took 2130 s against 833 s
+  for the control. The final model is the same size as in Part 2 (35,194,144
+  parameters).
+
+## What happened, in phases
+
+| Epochs | Steps | Mode | Val loss | Notes |
+|---|---|---|---|---|
+| 0-7 | 0-2000 | neuron | 4.0352 -> 2.6830 | identical to the control (2.6811 at epoch 7) |
+| 8-15 | 2000-4000 | dendrite | **2.6830 on every epoch** | main weights frozen; only the dendrite trains; params 38,307,104 |
+| 16-23 | 4000-6000 | neuron | 2.6539 -> 2.5022 | dendrite integrated; params 35,194,144 |
+
+The dendrite phase leaves validation loss unchanged to four decimals, which is
+how we know the main weights were frozen and the dendrite output was not yet
+connected. So the PB run got only 4000 main-weight updates in 6000 steps, and
+the right comparison for the final score is the control at 4000 steps.
+
+## Results
+
+| Comparison | Control | PB | Gap (PB - control) |
+|---|---|---|---|
+| Same total steps (6000) | **2.4121** (ppl 11.16) | 2.5022 (ppl 12.21) | +0.090 |
+| **Same main-weight steps (4000)** | 2.4996 (ppl 12.18) | 2.5022 (ppl 12.21) | **+0.003** |
+
+The first row only shows that 2000 steps spent training the dendrite alone cost
+progress on the main weights. The second row is the like-for-like comparison.
+
+After integration (PB epochs 16-23 against control epochs 8-15, the same number
+of main-weight steps):
+
+| PB epoch | Control | PB | Gap |
+|---|---|---|---|
+| 16 | 2.6345 | 2.6539 | +0.019 |
+| 17 | 2.6105 | 2.6254 | +0.015 |
+| 18 | 2.5854 | 2.5938 | +0.008 |
+| 19 | 2.5574 | 2.5699 | +0.013 |
+| 20 | 2.5379 | 2.5438 | +0.006 |
+| 21 | 2.5187 | 2.5225 | +0.004 |
+| 22 | 2.5077 | 2.5108 | +0.003 |
+| 23 | 2.4996 | 2.5022 | +0.003 |
+
+The shape matches Part 2: the dendrite model lags at first, the gap closes, and
+it never gets ahead. Part of the early lag comes from the script, which rebuilds
+the optimizer and restarts warmup after a restructure while the control does
+not. That confound works against the PB run; the converging gap suggests it is
+mild, but it was not isolated.
+
+## Correlation scores
+
+`PAI_head_pb/PAI_head_pb_beforeSwitch_1Best PBScores.csv` (not committed):
+the best score across nodes is 0.448 from dendrite epoch 1 and flat through
+epoch 7. The log shows the number of nodes still improving their score falling
+from 32,768 to under 1,000 within a few epochs, so most of the 8-epoch dendrite
+phase added nothing. We did not check whether that column is the best node or an
+average.
+
+## Caveats
+
+- Same limits as Part 2: one seed, constant learning rate with no final decay,
+  one small model.
+- The seed-to-seed spread between two same-seed controls here is about 0.004
+  nats at 4000 steps (2.4960 in Part 2, 2.4996 in Part 3), consistent with the
+  roughly 0.006 noise figure used elsewhere.
+- This shows PB does not help **on the head** at this setting. It does not show
+  PB cannot help this model elsewhere.
+- Wall times above are from the run receipts on an Apple Silicon Mac (MPS).
+
 ## Suggested next step
 
-The head is the wrong target: no quality gain, about 1.3MB it cannot afford and
-about a third of the speed. Remaining options, cheapest first:
-
-1. Perforated Backpropagation on the same setup (needs the license).
-2. A core layer (attention or FFN) as the target. It would cost kilobytes of
-   flash and a few percent of compute, so it could fit on the chip.
+The head is the wrong target with either kind of dendrite: no quality gain, 1.3MB
+it cannot afford on the ESP32 (see Part 2) and a large training-time cost. The
+remaining option worth testing is a core layer (attention or FFN) as the target,
+which would cost kilobytes of flash and a few percent of compute, so it could
+fit on the chip. With PB, dendrite phases should be shortened (the score
+plateaued after one epoch here), for example with a smaller `--switch-epochs` or
+patience settings.
